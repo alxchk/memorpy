@@ -14,8 +14,11 @@
 # You should have received a copy of the GNU General Public License
 # along with memorpy.  If not, see <http://www.gnu.org/licenses/>.
 
-from ctypes import pointer, sizeof, windll, create_string_buffer, c_ulong, byref, GetLastError, c_bool, WinError
+from ctypes import pointer, sizeof, windll, create_string_buffer, WinError
+from ctypes import c_ulong, byref, GetLastError, c_bool, c_size_t
+from ctypes.wintypes import HANDLE, DWORD, BOOL
 from structures import *
+
 import copy
 import struct
 import utils
@@ -26,9 +29,51 @@ psapi       = windll.psapi
 kernel32    = windll.kernel32
 advapi32    = windll.advapi32
 
-IsWow64Process=None
-if hasattr(kernel32,'IsWow64Process'):
-    IsWow64Process=kernel32.IsWow64Process
+OpenProcess = kernel32.OpenProcess
+OpenProcess.restype = HANDLE
+OpenProcess.argtypes = [ DWORD, BOOL, DWORD ]
+
+CloseHandle = kernel32.CloseHandle
+CloseHandle.argtypes = [ HANDLE ]
+
+GetCurrentProcess = kernel32.GetCurrentProcess
+GetCurrentProcess.restype = HANDLE
+
+GetSecurityInfo = advapi32.GetSecurityInfo
+GetSecurityInfo.restype = DWORD
+GetSecurityInfo.argtypes = [
+    HANDLE, DWORD, DWORD,
+    c_void_p, c_void_p, c_void_p, c_void_p, c_void_p
+]
+
+GetSystemInfo = kernel32.GetSystemInfo
+GetSystemInfo.argtypes = [ c_void_p ]
+
+GetNativeSystemInfo = kernel32.GetNativeSystemInfo
+GetNativeSystemInfo.argtypes = [ c_void_p ]
+
+SetSecurityInfo = advapi32.SetSecurityInfo
+SetSecurityInfo.restype = DWORD
+SetSecurityInfo.argtypes = [
+    HANDLE, DWORD, DWORD,
+    c_void_p, c_void_p, c_void_p, c_void_p
+]
+
+KVirtualProtectEx = kernel32.VirtualProtectEx
+KVirtualProtectEx.restype = BOOL
+KVirtualProtectEx.argtypes = [
+    HANDLE, c_void_p, c_size_t, DWORD, c_void_p
+]
+
+WriteProcessMemory = kernel32.WriteProcessMemory
+WriteProcessMemory.restype = BOOL
+WriteProcessMemory.argtypes = [
+    HANDLE, c_void_p, c_void_p, c_size_t, c_void_p
+]
+
+IsWow64Process = None
+if hasattr(kernel32, 'IsWow64Process'):
+    IsWow64Process = kernel32.IsWow64Process
     IsWow64Process.restype = c_bool
     IsWow64Process.argtypes = [c_void_p, POINTER(c_bool)]
 
@@ -39,12 +84,12 @@ class WinProcess(BaseProcess):
         super(WinProcess, self).__init__()
         if pid:
             self._open(int(pid), debug=debug)
-            
+
         elif name:
             self._open_from_name(name, debug=debug)
         else:
             raise ValueError("You need to instanciate process with at least a name or a pid")
-        
+
         if self.is_64bit():
             si = self.GetNativeSystemInfo()
             self.max_addr = si.lpMaximumApplicationAddress
@@ -86,12 +131,12 @@ class WinProcess(BaseProcess):
         pidProcess = [i for i in lpidProcess][:nReturned]
         for pid in pidProcess:
             proc={ "pid": int(pid) }
-            hProcess = kernel32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, pid)
+            hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, pid)
             if hProcess:
                 psapi.EnumProcessModules(hProcess, byref(hModule), sizeof(hModule), byref(count))
                 psapi.GetModuleBaseNameA(hProcess, hModule.value, modname, sizeof(modname))
-                proc["name"]=modname.value
-                kernel32.CloseHandle(hProcess)
+                proc["name"] = modname.value
+                CloseHandle(hProcess)
             processes.append(proc)
         return processes
 
@@ -122,11 +167,22 @@ class WinProcess(BaseProcess):
             ppSacl                  = DWORD()
             ppSecurityDescriptor    = SECURITY_DESCRIPTOR()
 
-            process = kernel32.OpenProcess(262144, 0, dwProcessId)
-            advapi32.GetSecurityInfo(kernel32.GetCurrentProcess(), 6, 0, byref(ppsidOwner), byref(ppsidGroup), byref(ppDacl), byref(ppSacl), byref(ppSecurityDescriptor))
-            advapi32.SetSecurityInfo(process, 6, DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION, None, None, ppSecurityDescriptor.dacl, ppSecurityDescriptor.group)
-            kernel32.CloseHandle(process)
-        self.h_process = kernel32.OpenProcess(2035711, 0, dwProcessId)
+            process = OpenProcess(262144, 0, dwProcessId)
+            GetSecurityInfo(
+                GetCurrentProcess(),
+                6, 0, byref(ppsidOwner),
+                byref(ppsidGroup), byref(ppDacl),
+                byref(ppSacl), byref(ppSecurityDescriptor)
+            )
+            SetSecurityInfo(
+                process, 6,
+                DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
+                None, None, ppSecurityDescriptor.dacl, ppSecurityDescriptor.group
+            )
+
+            CloseHandle(process)
+        self.h_process = OpenProcess(2035711, 0, dwProcessId)
+
         if self.h_process is not None:
             self.isProcessOpen = True
             self.pid = dwProcessId
@@ -135,7 +191,7 @@ class WinProcess(BaseProcess):
 
     def close(self):
         if self.h_process is not None:
-            ret = kernel32.CloseHandle(self.h_process) == 1
+            ret = CloseHandle(self.h_process) == 1
             if ret:
                 self.h_process = None
                 self.pid = None
@@ -156,12 +212,12 @@ class WinProcess(BaseProcess):
 
     def GetSystemInfo(self):
         si = SYSTEM_INFO()
-        kernel32.GetSystemInfo(byref(si))
+        GetSystemInfo(byref(si))
         return si
 
     def GetNativeSystemInfo(self):
         si = SYSTEM_INFO()
-        kernel32.GetNativeSystemInfo(byref(si))
+        GetNativeSystemInfo(byref(si))
         return si
 
     def VirtualQueryEx(self, lpAddress):
@@ -178,12 +234,12 @@ class WinProcess(BaseProcess):
 
     def VirtualProtectEx(self, base_address, size, protection):
         old_protect = c_ulong(0)
-        if not kernel32.VirtualProtectEx(self.h_process, base_address, size, protection, byref(old_protect)):
+        if not KVirtualProtectEx(self.h_process, base_address, size, protection, byref(old_protect)):
             raise ProcessException('Error: VirtualProtectEx(%08X, %d, %08X)' % (base_address, size, protection))
         return old_protect.value
 
     def iter_region(self, start_offset=None, end_offset=None, protec=None, optimizations=None):
-        
+
         offset = start_offset or self.min_addr
         end_offset = end_offset or self.max_addr
 
@@ -220,7 +276,7 @@ class WinProcess(BaseProcess):
         except:
             pass
 
-        res = kernel32.WriteProcessMemory(self.h_process, address, buffer, bufferSize, byref(sizeWriten))
+        res = WriteProcessMemory(self.h_process, address, buffer, bufferSize, byref(sizeWriten))
         try:
             self.VirtualProtectEx(_address, _length, old_protect)
         except:
@@ -264,7 +320,7 @@ class WinProcess(BaseProcess):
             # address += bytesread.value
         return data
 
-   
+
     def list_modules(self):
         module_list = []
         if self.pid is not None:
@@ -278,7 +334,7 @@ class WinProcess(BaseProcess):
                         module_list.append(copy.copy(module_entry))
                     success = Module32Next(hModuleSnap, byref(module_entry))
 
-                kernel32.CloseHandle(hModuleSnap)
+                CloseHandle(hModuleSnap)
         return module_list
 
     def get_symbolic_name(self, address):
@@ -296,7 +352,7 @@ class WinProcess(BaseProcess):
             if module in m.szExePath.split('\\'):
                 return True
         return False
-    
+
 
     def get_instruction(self, address):
         """
@@ -309,4 +365,3 @@ class WinProcess(BaseProcess):
             return 'Unable to disassemble at %08x' % address
 
         return pydasm.get_instruction(data, pydasm.MODE_32)
-
